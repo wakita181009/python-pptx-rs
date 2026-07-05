@@ -46,6 +46,7 @@ dev = [
 line-length = 120
 target-version = "py310"
 src = ["python", "tests"]
+extend-exclude = ["tests/compat/features/steps"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]

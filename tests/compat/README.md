@@ -2,14 +2,12 @@
 
 Runs python-pptx's own behave feature suite against `pptx_rs`.
 
-`features/` symlinks a subset of `../python-pptx/features/*.feature` plus its
-`steps/` directory. Our `environment.py` (loaded by behave before step modules)
-replaces `pptx.Presentation` with `pptx_rs.Presentation`, so every scenario
-exercises the Rust implementation while python-pptx's enums/helpers stay
-importable for the step definitions.
-
-Requires the python-pptx repo checked out as a sibling:
-`../python-pptx` (feature files and fixture .pptx files are read from there).
+`features/` vendors a subset of python-pptx's `features/*.feature` plus its
+`steps/` directory (including `steps/test_files/` fixtures). Our
+`environment.py` (loaded by behave before step modules) replaces
+`pptx.Presentation` with `pptx_rs.Presentation`, so every scenario exercises
+the Rust implementation while python-pptx's enums/helpers stay importable for
+the step definitions (python-pptx itself is a dev dependency from PyPI).
 
 ```bash
 uv run behave tests/compat/features -f plain

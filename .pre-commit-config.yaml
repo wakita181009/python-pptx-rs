@@ -1,3 +1,7 @@
+# tests/compat/features/steps/ is vendored verbatim from python-pptx —
+# keep it byte-identical to upstream, so no formatting/lint hooks touch it.
+exclude: ^tests/compat/features/steps/
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
