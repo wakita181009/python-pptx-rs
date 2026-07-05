@@ -35,5 +35,18 @@ compatibility suite a python-pptx checkout at `../python-pptx`.
 ```bash
 uv sync
 uv run maturin develop --uv
-uv run pytest
+uv run pytest  # includes Python coverage (fails under 80%)
+```
+
+Rust coverage (merges `cargo test` with pytest run against an instrumented
+build, since the PyO3 binding crate is only exercised through Python):
+
+```bash
+cargo install cargo-llvm-cov
+source <(cargo llvm-cov show-env --export-prefix)
+cargo llvm-cov clean --workspace
+cargo test --workspace
+uv run --no-sync maturin develop --uv
+uv run --no-sync pytest --no-cov
+cargo llvm-cov report --fail-under-lines 80
 ```
