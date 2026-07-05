@@ -12,4 +12,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pptx-core = { path = "../pptx-core" }
+pyenum = "0.0.5"
 pyo3 = { version = "0.29.0", features = ["abi3-py310", "extension-module"] }

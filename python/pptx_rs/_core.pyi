@@ -1,10 +1,39 @@
 """Type stubs for the Rust extension module."""
 
+import enum
 import os
 from collections.abc import Iterator
 from typing import IO
 
 __version__: str
+
+class MSO_SHAPE_TYPE(enum.IntEnum):
+    AUTO_SHAPE = 1
+    CALLOUT = 2
+    CANVAS = 20
+    CHART = 3
+    COMMENT = 4
+    DIAGRAM = 21
+    EMBEDDED_OLE_OBJECT = 7
+    FORM_CONTROL = 8
+    FREEFORM = 5
+    GROUP = 6
+    IGX_GRAPHIC = 24
+    INK = 22
+    INK_COMMENT = 23
+    LINE = 9
+    LINKED_OLE_OBJECT = 10
+    LINKED_PICTURE = 11
+    MEDIA = 16
+    OLE_CONTROL_OBJECT = 12
+    PICTURE = 13
+    PLACEHOLDER = 14
+    SCRIPT_ANCHOR = 18
+    TABLE = 19
+    TEXT_BOX = 17
+    TEXT_EFFECT = 15
+    WEB_VIDEO = 26
+    MIXED = -2
 
 class Presentation:
     @staticmethod
@@ -38,6 +67,14 @@ class Slide:
     def shapes(self) -> SlideShapes: ...
     @property
     def slide_layout(self) -> SlideLayout: ...
+    @property
+    def has_notes_slide(self) -> bool: ...
+    @property
+    def notes_slide(self) -> NotesSlide: ...
+
+class NotesSlide:
+    @property
+    def notes_text_frame(self) -> TextFrame | None: ...
 
 class SlideMasters:
     def __len__(self) -> int: ...
@@ -66,6 +103,8 @@ class SlideShapes:
     def __getitem__(self, idx: int) -> Shape: ...
     def __iter__(self) -> Iterator[Shape]: ...
     def add_textbox(self, left: int, top: int, width: int, height: int) -> Shape: ...
+    @property
+    def title(self) -> Shape | None: ...
 
 class Shape:
     @property
@@ -76,11 +115,80 @@ class Shape:
     def has_text_frame(self) -> bool: ...
     @property
     def text_frame(self) -> TextFrame: ...
+    @property
+    def shape_type(self) -> MSO_SHAPE_TYPE | None: ...
+    @property
+    def has_chart(self) -> bool: ...
+    @property
+    def chart(self) -> Chart: ...
+    @property
+    def table(self) -> Table: ...
+    @property
+    def image(self) -> Image: ...
+    @property
+    def shapes(self) -> SlideShapes: ...
+    @property
+    def _element(self) -> _XmlElement: ...
     text: str
     left: int | None
     top: int | None
     width: int | None
     height: int | None
+
+class _XmlElement:
+    def __getattr__(self, name: str) -> _XmlElement: ...
+    @property
+    def attrib(self) -> dict[str, str]: ...
+
+class Table:
+    @property
+    def rows(self) -> list[_Row]: ...
+
+class _Row:
+    @property
+    def cells(self) -> list[_Cell]: ...
+
+class _Cell:
+    @property
+    def text(self) -> str: ...
+
+class Chart:
+    @property
+    def has_title(self) -> bool: ...
+    @property
+    def chart_title(self) -> ChartTitle: ...
+    @property
+    def plots(self) -> list[_BasePlot]: ...
+    @property
+    def series(self) -> list[Series]: ...
+
+class ChartTitle:
+    @property
+    def text_frame(self) -> TextFrame: ...
+
+class _BasePlot:
+    @property
+    def categories(self) -> list[Category]: ...
+
+class Category:
+    @property
+    def label(self) -> str: ...
+
+class Series:
+    @property
+    def name(self) -> str: ...
+    @property
+    def values(self) -> tuple[float | None, ...]: ...
+
+class Image:
+    @property
+    def blob(self) -> bytes: ...
+    @property
+    def ext(self) -> str: ...
+    @property
+    def content_type(self) -> str: ...
+    @property
+    def filename(self) -> str: ...
 
 class TextFrame:
     @property
