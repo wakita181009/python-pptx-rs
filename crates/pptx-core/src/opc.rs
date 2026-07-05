@@ -143,6 +143,113 @@ impl Package {
     pub fn resolve_target(&self, source_part: &str, target: &str) -> String {
         resolve_target(source_part, target)
     }
+
+    /// Add a new XML part and register its content type as an Override.
+    pub fn add_xml_part(&mut self, name: &str, content_type: &str, doc: Document) -> Result<()> {
+        if self.contains(name) {
+            return Err(Error::InvalidPackage(format!(
+                "part already exists: {name}"
+            )));
+        }
+        let ct = self.doc_mut(CONTENT_TYPES_PART)?;
+        let root = ct.root;
+        let override_el = ct.create_element(
+            ns::CT,
+            "",
+            "Override",
+            &[
+                ("PartName", &format!("/{name}")),
+                ("ContentType", content_type),
+            ],
+        );
+        ct.append_child(root, override_el);
+        self.order.push(name.to_string());
+        self.parts.insert(
+            name.to_string(),
+            Part {
+                raw: None,
+                doc: Some(doc),
+                dirty: true,
+            },
+        );
+        Ok(())
+    }
+
+    /// Add a relationship from `source_part`, creating its rels part when
+    /// missing, and return the assigned rId.
+    pub fn add_relationship(
+        &mut self,
+        source_part: &str,
+        reltype: &str,
+        target: &str,
+    ) -> Result<String> {
+        let rels_name = rels_part_name(source_part);
+        if !self.contains(&rels_name) {
+            // .rels parts are covered by the package's Default content-type
+            // rule, so no [Content_Types].xml entry is needed.
+            let doc = Document::parse(EMPTY_RELS_XML.as_bytes())?;
+            self.order.push(rels_name.clone());
+            self.parts.insert(
+                rels_name.clone(),
+                Part {
+                    raw: None,
+                    doc: Some(doc),
+                    dirty: true,
+                },
+            );
+        }
+        let doc = self.doc_mut(&rels_name)?;
+        let max_n = doc
+            .children_named(doc.root, ns::REL, "Relationship")
+            .into_iter()
+            .filter_map(|rel| {
+                doc.attr(rel, "Id")
+                    .and_then(|v| v.strip_prefix("rId"))
+                    .and_then(|v| v.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        let rid = format!("rId{}", max_n + 1);
+        let root = doc.root;
+        let el = doc.create_element(
+            ns::REL,
+            "",
+            "Relationship",
+            &[("Id", &rid), ("Type", reltype), ("Target", target)],
+        );
+        doc.append_child(root, el);
+        Ok(rid)
+    }
+}
+
+const CONTENT_TYPES_PART: &str = "[Content_Types].xml";
+
+const EMPTY_RELS_XML: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+    "\r\n",
+    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#,
+);
+
+/// Relative path from `source_part`'s directory to `target_part`
+/// (e.g. `ppt/slides/slide1.xml` → `ppt/slideLayouts/x.xml` is
+/// `../slideLayouts/x.xml`).
+pub fn relative_target(source_part: &str, target_part: &str) -> String {
+    let src_dir: Vec<&str> = match source_part.rsplit_once('/') {
+        Some((dir, _)) => dir.split('/').collect(),
+        None => Vec::new(),
+    };
+    let tgt: Vec<&str> = target_part.split('/').collect();
+    let (tgt_dir, tgt_base) = tgt.split_at(tgt.len() - 1);
+    let common = src_dir
+        .iter()
+        .zip(tgt_dir.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut segments: Vec<&str> = Vec::new();
+    segments.extend(std::iter::repeat_n("..", src_dir.len() - common));
+    segments.extend(&tgt_dir[common..]);
+    segments.push(tgt_base[0]);
+    segments.join("/")
 }
 
 pub fn rels_part_name(part_name: &str) -> String {
@@ -189,6 +296,22 @@ mod tests {
         );
         assert_eq!(
             resolve_target("ppt/presentation.xml", "/docProps/core.xml"),
+            "docProps/core.xml"
+        );
+    }
+
+    #[test]
+    fn computes_relative_targets() {
+        assert_eq!(
+            relative_target("ppt/presentation.xml", "ppt/slides/slide1.xml"),
+            "slides/slide1.xml"
+        );
+        assert_eq!(
+            relative_target("ppt/slides/slide1.xml", "ppt/slideLayouts/slideLayout2.xml"),
+            "../slideLayouts/slideLayout2.xml"
+        );
+        assert_eq!(
+            relative_target("", "docProps/core.xml"),
             "docProps/core.xml"
         );
     }

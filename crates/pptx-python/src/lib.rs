@@ -25,6 +25,27 @@ fn to_py(e: Error) -> PyErr {
 }
 
 const OFFICE_DOCUMENT_RELTYPE_SUFFIX: &str = "/officeDocument";
+const SLIDE_MASTER_RELTYPE_SUFFIX: &str = "/slideMaster";
+const SLIDE_LAYOUT_RELTYPE_SUFFIX: &str = "/slideLayout";
+const SLIDE_RELTYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
+const SLIDE_LAYOUT_RELTYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout";
+const SLIDE_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
+/// Base XML for a new slide part (python-pptx's CT_Slide.new template).
+const NEW_SLIDE_XML: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+    "\r\n",
+    r#"<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">"#,
+    r#"<p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:spTree></p:cSld>"#,
+    r#"<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>"#,
+    r#"</p:sld>"#,
+);
+/// Layout placeholders NOT cloned onto a new slide (python-pptx semantics).
+const LATENT_PH_TYPES: [&str; 3] = ["dt", "ftr", "sldNum"];
+/// Placeholder types that get an empty text body on the new slide.
+const TEXT_PH_TYPES: [&str; 5] = ["title", "ctrTitle", "subTitle", "body", "obj"];
 /// python-pptx maps `a:br` to a vertical-tab character in text getters/setters.
 const VERTICAL_TAB: char = '\u{0B}';
 const SHAPE_TAGS: [&str; 5] = ["sp", "pic", "graphicFrame", "grpSp", "cxnSp"];
@@ -117,6 +138,40 @@ impl Presentation {
             .and_then(|n| doc.attr(n, attr))
             .and_then(|v| v.parse().ok()))
     }
+
+    /// Part names referenced from `id_lst` children (`p:sldMasterId`,
+    /// `p:sldLayoutId`, ...) of `part`, in document order.
+    fn rel_id_list_parts(
+        &mut self,
+        part: &str,
+        lst_local: &str,
+        id_local: &str,
+    ) -> PyResult<Vec<String>> {
+        let rels = self.pkg.rels(part).map_err(to_py)?;
+        let rel_targets: HashMap<String, String> = rels
+            .into_iter()
+            .map(|r| (r.id, self.pkg.resolve_target(part, &r.target)))
+            .collect();
+        let doc = self.pkg.doc(part).map_err(to_py)?;
+        let Some(lst) = doc.first_child_named(doc.root, ns::P, lst_local) else {
+            return Ok(Vec::new());
+        };
+        Ok(doc
+            .children_named(lst, ns::P, id_local)
+            .into_iter()
+            .filter_map(|n| doc.attr(n, "r:id"))
+            .filter_map(|rid| rel_targets.get(rid).cloned())
+            .collect())
+    }
+
+    fn master_parts(&mut self) -> PyResult<Vec<String>> {
+        let part = self.part_name.clone();
+        self.rel_id_list_parts(&part, "sldMasterIdLst", "sldMasterId")
+    }
+
+    fn layout_parts(&mut self, master_part: &str) -> PyResult<Vec<String>> {
+        self.rel_id_list_parts(master_part, "sldLayoutIdLst", "sldLayoutId")
+    }
 }
 
 #[pymethods]
@@ -135,6 +190,27 @@ impl Presentation {
     #[getter]
     fn slides(slf: Py<Self>) -> Slides {
         Slides { prs: slf }
+    }
+
+    #[getter]
+    fn slide_masters(slf: Py<Self>) -> SlideMasters {
+        SlideMasters { prs: slf }
+    }
+
+    /// Layouts of the first slide master (python-pptx convenience shortcut).
+    #[getter]
+    fn slide_layouts(slf: Py<Self>, py: Python<'_>) -> PyResult<SlideLayouts> {
+        let master_part = {
+            let mut prs = slf.borrow_mut(py);
+            prs.master_parts()?
+                .into_iter()
+                .next()
+                .ok_or_else(|| PyValueError::new_err("presentation has no slide master"))?
+        };
+        Ok(SlideLayouts {
+            prs: slf,
+            master_part,
+        })
     }
 
     #[getter]
@@ -206,6 +282,174 @@ impl Slides {
             .collect();
         Ok(PyList::new(py, slides)?.try_iter()?.unbind())
     }
+
+    fn add_slide(&self, py: Python<'_>, slide_layout: PyRef<'_, SlideLayout>) -> PyResult<Slide> {
+        let layout_part = slide_layout.part.clone();
+        let mut prs = self.prs.borrow_mut(py);
+
+        // placeholder specs from the layout: (name, ph attrs), latent ones skipped
+        let ph_specs: Vec<(String, Vec<(String, String)>)> = {
+            let ldoc = prs.doc(&layout_part)?;
+            let tree = sp_tree(ldoc)?;
+            ldoc.children_named(tree, ns::P, "sp")
+                .into_iter()
+                .filter_map(|sp| {
+                    let nv_sp_pr = ldoc.first_child_named(sp, ns::P, "nvSpPr")?;
+                    let nv_pr = ldoc.first_child_named(nv_sp_pr, ns::P, "nvPr")?;
+                    let ph = ldoc.first_child_named(nv_pr, ns::P, "ph")?;
+                    let ph_type = ldoc.attr(ph, "type").unwrap_or("obj");
+                    if LATENT_PH_TYPES.contains(&ph_type) {
+                        return None;
+                    }
+                    let name = c_nv_pr(ldoc, sp)
+                        .and_then(|n| ldoc.attr(n, "name"))
+                        .unwrap_or_default()
+                        .to_string();
+                    Some((name, ldoc.get(ph).attrs.clone()))
+                })
+                .collect()
+        };
+
+        let mut sdoc = Document::parse(NEW_SLIDE_XML.as_bytes()).map_err(to_py)?;
+        let tree = sp_tree(&sdoc)?;
+        let mut next_id = 2u32;
+        for (name, ph_attrs) in &ph_specs {
+            let sp = new_placeholder_sp(&mut sdoc, next_id, name, ph_attrs);
+            sdoc.append_child(tree, sp);
+            next_id += 1;
+        }
+
+        let part = next_slide_part_name(prs.pkg.part_names());
+        prs.pkg
+            .add_xml_part(&part, SLIDE_CONTENT_TYPE, sdoc)
+            .map_err(to_py)?;
+        prs.next_shape_ids.insert(part.clone(), next_id);
+
+        let layout_target = pptx_core::opc::relative_target(&part, &layout_part);
+        prs.pkg
+            .add_relationship(&part, SLIDE_LAYOUT_RELTYPE, &layout_target)
+            .map_err(to_py)?;
+
+        let pres_part = prs.part_name.clone();
+        let slide_target = pptx_core::opc::relative_target(&pres_part, &part);
+        let rid = prs
+            .pkg
+            .add_relationship(&pres_part, SLIDE_RELTYPE, &slide_target)
+            .map_err(to_py)?;
+
+        // python-pptx assigns slide ids starting at 256
+        let slide_id = prs
+            .slide_entries
+            .iter()
+            .map(|(_, id)| *id)
+            .max()
+            .unwrap_or(255)
+            .max(255)
+            + 1;
+        let pdoc = prs.doc_mut(&pres_part)?;
+        let sld_id_lst = get_or_add_sld_id_lst(pdoc)?;
+        let sld_id = pdoc.create_element(
+            ns::P,
+            "p",
+            "sldId",
+            &[("id", slide_id.to_string().as_str()), ("r:id", &rid)],
+        );
+        pdoc.append_child(sld_id_lst, sld_id);
+        prs.slide_entries.push((part.clone(), slide_id));
+        drop(prs);
+
+        Ok(Slide {
+            prs: self.prs.clone_ref(py),
+            part,
+            slide_id,
+        })
+    }
+}
+
+/// Next free `ppt/slides/slideN.xml` part name.
+fn next_slide_part_name(part_names: &[String]) -> String {
+    let max_n = part_names
+        .iter()
+        .filter_map(|n| {
+            n.strip_prefix("ppt/slides/slide")
+                .and_then(|s| s.strip_suffix(".xml"))
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .max()
+        .unwrap_or(0);
+    format!("ppt/slides/slide{}.xml", max_n + 1)
+}
+
+/// Get `p:sldIdLst`, creating it right after `p:sldMasterIdLst` when missing
+/// (the schema orders it before `p:sldSz`).
+fn get_or_add_sld_id_lst(doc: &mut Document) -> PyResult<NodeId> {
+    if let Some(lst) = doc.first_child_named(doc.root, ns::P, "sldIdLst") {
+        return Ok(lst);
+    }
+    let root = doc.root;
+    let lst = doc.create_element(ns::P, "p", "sldIdLst", &[]);
+    let index = doc
+        .child_elements(root)
+        .into_iter()
+        .position(|c| doc.is(c, ns::P, "sldMasterIdLst"))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    doc.insert_child(root, index, lst);
+    Ok(lst)
+}
+
+/// Build a fresh placeholder `p:sp` (python-pptx's `new_placeholder_sp`),
+/// copying the layout placeholder's `p:ph` attributes verbatim.
+fn new_placeholder_sp(
+    doc: &mut Document,
+    shape_id: u32,
+    name: &str,
+    ph_attrs: &[(String, String)],
+) -> NodeId {
+    let id_s = shape_id.to_string();
+    let sp = doc.create_element(ns::P, "p", "sp", &[]);
+
+    let nv_sp_pr = doc.create_element(ns::P, "p", "nvSpPr", &[]);
+    let c_nv_pr = doc.create_element(
+        ns::P,
+        "p",
+        "cNvPr",
+        &[("id", id_s.as_str()), ("name", name)],
+    );
+    let c_nv_sp_pr = doc.create_element(ns::P, "p", "cNvSpPr", &[]);
+    let sp_locks = doc.create_element(ns::A, "a", "spLocks", &[("noGrp", "1")]);
+    doc.append_child(c_nv_sp_pr, sp_locks);
+    let nv_pr = doc.create_element(ns::P, "p", "nvPr", &[]);
+    let ph = doc.create_element(ns::P, "p", "ph", &[]);
+    for (k, v) in ph_attrs {
+        doc.set_attr(ph, k, v);
+    }
+    doc.append_child(nv_pr, ph);
+    doc.append_child(nv_sp_pr, c_nv_pr);
+    doc.append_child(nv_sp_pr, c_nv_sp_pr);
+    doc.append_child(nv_sp_pr, nv_pr);
+    doc.append_child(sp, nv_sp_pr);
+
+    let sp_pr = doc.create_element(ns::P, "p", "spPr", &[]);
+    doc.append_child(sp, sp_pr);
+
+    let ph_type = ph_attrs
+        .iter()
+        .find(|(k, _)| k == "type")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("obj");
+    if TEXT_PH_TYPES.contains(&ph_type) {
+        let tx_body = doc.create_element(ns::P, "p", "txBody", &[]);
+        let body_pr = doc.create_element(ns::A, "a", "bodyPr", &[]);
+        let lst_style = doc.create_element(ns::A, "a", "lstStyle", &[]);
+        let p = doc.create_element(ns::A, "a", "p", &[]);
+        doc.append_child(tx_body, body_pr);
+        doc.append_child(tx_body, lst_style);
+        doc.append_child(tx_body, p);
+        doc.append_child(sp, tx_body);
+    }
+
+    sp
 }
 
 // ---------------------------------------------------------------------------
@@ -245,11 +489,205 @@ impl Slide {
         }
     }
 
+    #[getter]
+    fn slide_layout(&self, py: Python<'_>) -> PyResult<SlideLayout> {
+        let mut prs = self.prs.borrow_mut(py);
+        let rels = prs.pkg.rels(&self.part).map_err(to_py)?;
+        let layout_part = rels
+            .iter()
+            .find(|r| r.reltype.ends_with(SLIDE_LAYOUT_RELTYPE_SUFFIX))
+            .map(|r| prs.pkg.resolve_target(&self.part, &r.target))
+            .ok_or_else(|| PyValueError::new_err("slide has no slide-layout relationship"))?;
+        drop(prs);
+        Ok(SlideLayout {
+            prs: self.prs.clone_ref(py),
+            part: layout_part,
+        })
+    }
+
     fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
         other
             .extract::<PyRef<'_, Slide>>()
             .is_ok_and(|o| self.prs.as_ptr() == o.prs.as_ptr() && self.part == o.part)
     }
+}
+
+// ---------------------------------------------------------------------------
+// SlideMasters / SlideMaster / SlideLayouts / SlideLayout
+// ---------------------------------------------------------------------------
+
+#[pyclass(module = "pptx_rs._core")]
+pub struct SlideMasters {
+    prs: Py<Presentation>,
+}
+
+#[pymethods]
+impl SlideMasters {
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.prs.borrow_mut(py).master_parts()?.len())
+    }
+
+    fn __getitem__(&self, py: Python<'_>, idx: isize) -> PyResult<SlideMaster> {
+        let parts = self.prs.borrow_mut(py).master_parts()?;
+        let i = normalize_index(idx, parts.len(), "slide master")?;
+        Ok(SlideMaster {
+            prs: self.prs.clone_ref(py),
+            part: parts[i].clone(),
+        })
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyIterator>> {
+        let masters: Vec<SlideMaster> = self
+            .prs
+            .borrow_mut(py)
+            .master_parts()?
+            .into_iter()
+            .map(|part| SlideMaster {
+                prs: self.prs.clone_ref(py),
+                part,
+            })
+            .collect();
+        Ok(PyList::new(py, masters)?.try_iter()?.unbind())
+    }
+}
+
+#[pyclass(module = "pptx_rs._core")]
+pub struct SlideMaster {
+    prs: Py<Presentation>,
+    part: String,
+}
+
+#[pymethods]
+impl SlideMaster {
+    #[getter]
+    fn slide_layouts(&self, py: Python<'_>) -> SlideLayouts {
+        SlideLayouts {
+            prs: self.prs.clone_ref(py),
+            master_part: self.part.clone(),
+        }
+    }
+}
+
+#[pyclass(module = "pptx_rs._core")]
+pub struct SlideLayouts {
+    prs: Py<Presentation>,
+    master_part: String,
+}
+
+impl SlideLayouts {
+    fn parts(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        self.prs.borrow_mut(py).layout_parts(&self.master_part)
+    }
+
+    fn layout(&self, py: Python<'_>, part: String) -> SlideLayout {
+        SlideLayout {
+            prs: self.prs.clone_ref(py),
+            part,
+        }
+    }
+}
+
+#[pymethods]
+impl SlideLayouts {
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.parts(py)?.len())
+    }
+
+    fn __getitem__(&self, py: Python<'_>, idx: isize) -> PyResult<SlideLayout> {
+        let parts = self.parts(py)?;
+        let i = normalize_index(idx, parts.len(), "slide layout")?;
+        Ok(self.layout(py, parts[i].clone()))
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyIterator>> {
+        let layouts: Vec<SlideLayout> = self
+            .parts(py)?
+            .into_iter()
+            .map(|part| self.layout(py, part))
+            .collect();
+        Ok(PyList::new(py, layouts)?.try_iter()?.unbind())
+    }
+
+    /// The layout named `name`, or None (python-pptx API).
+    #[pyo3(signature = (name, default=None))]
+    fn get_by_name(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        for part in self.parts(py)? {
+            let layout = self.layout(py, part);
+            if layout.name(py)? == name {
+                return Ok(Some(Py::new(py, layout)?.into_any()));
+            }
+        }
+        Ok(default)
+    }
+
+    /// Index of `slide_layout` in this collection (python-pptx API).
+    fn index(&self, py: Python<'_>, slide_layout: PyRef<'_, SlideLayout>) -> PyResult<usize> {
+        if slide_layout.prs.as_ptr() != self.prs.as_ptr() {
+            return Err(PyValueError::new_err(
+                "layout not in this SlideLayouts collection",
+            ));
+        }
+        self.parts(py)?
+            .iter()
+            .position(|p| *p == slide_layout.part)
+            .ok_or_else(|| PyValueError::new_err("layout not in this SlideLayouts collection"))
+    }
+}
+
+#[pyclass(module = "pptx_rs._core")]
+pub struct SlideLayout {
+    prs: Py<Presentation>,
+    part: String,
+}
+
+#[pymethods]
+impl SlideLayout {
+    #[getter]
+    fn name(&self, py: Python<'_>) -> PyResult<String> {
+        let mut prs = self.prs.borrow_mut(py);
+        let doc = prs.doc(&self.part)?;
+        Ok(doc
+            .first_child_named(doc.root, ns::P, "cSld")
+            .and_then(|n| doc.attr(n, "name"))
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    #[getter]
+    fn slide_master(&self, py: Python<'_>) -> PyResult<SlideMaster> {
+        let mut prs = self.prs.borrow_mut(py);
+        let rels = prs.pkg.rels(&self.part).map_err(to_py)?;
+        let master_part = rels
+            .iter()
+            .find(|r| r.reltype.ends_with(SLIDE_MASTER_RELTYPE_SUFFIX))
+            .map(|r| prs.pkg.resolve_target(&self.part, &r.target))
+            .ok_or_else(|| PyValueError::new_err("layout has no slide-master relationship"))?;
+        drop(prs);
+        Ok(SlideMaster {
+            prs: self.prs.clone_ref(py),
+            part: master_part,
+        })
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        other
+            .extract::<PyRef<'_, SlideLayout>>()
+            .is_ok_and(|o| self.prs.as_ptr() == o.prs.as_ptr() && self.part == o.part)
+    }
+}
+
+fn normalize_index(idx: isize, len: usize, what: &str) -> PyResult<usize> {
+    let len = len as isize;
+    let i = if idx < 0 { idx + len } else { idx };
+    if i < 0 || i >= len {
+        return Err(PyIndexError::new_err(format!("{what} index out of range")));
+    }
+    Ok(i as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +1311,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Presentation>()?;
     m.add_class::<Slides>()?;
     m.add_class::<Slide>()?;
+    m.add_class::<SlideMasters>()?;
+    m.add_class::<SlideMaster>()?;
+    m.add_class::<SlideLayouts>()?;
+    m.add_class::<SlideLayout>()?;
     m.add_class::<SlideShapes>()?;
     m.add_class::<Shape>()?;
     m.add_class::<TextFrame>()?;
