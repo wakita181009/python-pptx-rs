@@ -3,7 +3,7 @@
 Rust-powered, [python-pptx](https://github.com/scanny/python-pptx)-compatible library for
 creating, reading, and updating PowerPoint (.pptx) files.
 
-- Drop-in compatible public API (`import pptx_rs as pptx`)
+- Drop-in compatible public API: `pip install python-pptx-rs`, then `import pptx_rs as pptx`
 - Rust core (quick-xml + zip) via PyO3, single abi3 wheel for Python 3.10-3.14
 - O(1) shape-id assignment and relationship lookup (quadratic in python-pptx)
 - Untouched parts round-trip byte-exactly
@@ -12,7 +12,7 @@ creating, reading, and updating PowerPoint (.pptx) files.
 
 1000 slides x 10 textboxes, macOS arm64, median of 3 (`benches/bench_vs_python_pptx.py`):
 
-| workload | python-pptx | pptx_rs | speedup |
+| workload | python-pptx | python-pptx-rs | speedup |
 |---|---|---|---|
 | open | 85.0ms | 8.9ms | 9.5x |
 | open + traverse all text | 316.2ms | 73.5ms | 4.3x |
@@ -22,9 +22,9 @@ creating, reading, and updating PowerPoint (.pptx) files.
 
 ## Compatibility
 
-python-pptx's own behave feature suite runs against `pptx_rs` — see
+python-pptx's own behave feature suite runs against python-pptx-rs — see
 [tests/compat/README.md](tests/compat/README.md) for the current matrix
-(65 scenarios passing; all remaining gaps are unimplemented APIs, not
+(75 scenarios passing; all remaining gaps are unimplemented APIs, not
 behavioral divergences).
 
 ## Development
