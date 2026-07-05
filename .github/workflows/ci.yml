@@ -29,16 +29,22 @@ jobs:
           python-version: "3.10"
 
       - name: ruff check
-        run: uvx ruff check --output-format=github python tests
+        run: uvx ruff check --output-format=github python tests benches
 
       - name: ruff format
-        run: uvx ruff format --check python tests
+        run: uvx ruff format --check python tests benches
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build extension and install dev dependencies
+        run: uv sync
+
+      - name: ty check
+        run: uv run ty check python tests benches
 
   rust-test:
     runs-on: ubuntu-latest
