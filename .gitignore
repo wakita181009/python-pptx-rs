@@ -1,0 +1,22 @@
+# Rust
+/target
+
+# Python
+__pycache__/
+*.pyc
+*.so
+.venv/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Test output
+tests/compat/features/_scratch/
+
+# Tools
+graphify-out/
+.claude/settings.local.json
+
+# OS
+.DS_Store

@@ -1,0 +1,12 @@
+[package]
+name = "pptx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core OOXML PresentationML engine for python-pptx-rs"
+
+[dependencies]
+quick-xml = "0.41.0"
+thiserror = "2.0.18"
+zip = "8.6.0"
