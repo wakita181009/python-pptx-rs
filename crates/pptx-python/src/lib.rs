@@ -4,6 +4,7 @@
 //! owning part's DOM, so one attribute access is a single Rust call instead of
 //! python-pptx's descriptor/lxml call chain.
 
+mod autoshapes;
 mod chart;
 mod enums;
 mod image;
@@ -46,6 +47,8 @@ const SLIDE_RELTYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
 const SLIDE_LAYOUT_RELTYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout";
+const IMAGE_RELTYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 const SLIDE_CONTENT_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
 /// Base XML for a new slide part (python-pptx's CT_Slide.new template).
@@ -807,12 +810,27 @@ impl SlideShapes {
         Ok(shape_children(doc, parent))
     }
 
-    fn shape(&self, py: Python<'_>, node: NodeId) -> Shape {
-        Shape {
+    /// python-pptx's shape factory: the proxy class depends on the element
+    /// tag (`Picture`, `GraphicFrame`, `GroupShape`, `Connector`, `Shape`).
+    fn shape(&self, py: Python<'_>, node: NodeId) -> PyResult<Py<PyAny>> {
+        let local = {
+            let mut prs = self.prs.borrow_mut(py);
+            let doc = prs.doc(&self.part)?;
+            doc.get(node).local.clone()
+        };
+        let base = Shape {
             prs: self.prs.clone_ref(py),
             part: self.part.clone(),
             node,
-        }
+        };
+        let init = PyClassInitializer::from(base);
+        Ok(match local.as_str() {
+            "pic" => Py::new(py, init.add_subclass(Picture))?.into_any(),
+            "graphicFrame" => Py::new(py, init.add_subclass(GraphicFrame))?.into_any(),
+            "grpSp" => Py::new(py, init.add_subclass(GroupShape))?.into_any(),
+            "cxnSp" => Py::new(py, init.add_subclass(Connector))?.into_any(),
+            _ => Py::new(py, init)?.into_any(),
+        })
     }
 }
 
@@ -822,22 +840,22 @@ impl SlideShapes {
         Ok(self.nodes(py)?.len())
     }
 
-    fn __getitem__(&self, py: Python<'_>, idx: isize) -> PyResult<Shape> {
+    fn __getitem__(&self, py: Python<'_>, idx: isize) -> PyResult<Py<PyAny>> {
         let nodes = self.nodes(py)?;
         let len = nodes.len() as isize;
         let i = if idx < 0 { idx + len } else { idx };
         if i < 0 || i >= len {
             return Err(PyIndexError::new_err("shape index out of range"));
         }
-        Ok(self.shape(py, nodes[i as usize]))
+        self.shape(py, nodes[i as usize])
     }
 
     fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyIterator>> {
-        let shapes: Vec<Shape> = self
+        let shapes: Vec<Py<PyAny>> = self
             .nodes(py)?
             .into_iter()
             .map(|n| self.shape(py, n))
-            .collect();
+            .collect::<PyResult<_>>()?;
         Ok(PyList::new(py, shapes)?.try_iter()?.unbind())
     }
 
@@ -848,7 +866,7 @@ impl SlideShapes {
         top: i64,
         width: i64,
         height: i64,
-    ) -> PyResult<Shape> {
+    ) -> PyResult<Py<PyAny>> {
         let mut prs = self.prs.borrow_mut(py);
         let shape_id = prs.take_next_shape_id(&self.part)?;
         let name = format!("TextBox {}", shape_id - 1);
@@ -860,12 +878,139 @@ impl SlideShapes {
         let sp = new_textbox_sp(doc, shape_id, &name, left, top, width, height);
         doc.append_child(tree, sp);
         drop(prs);
-        Ok(self.shape(py, sp))
+        self.shape(py, sp)
+    }
+
+    /// python-pptx `SlideShapes.add_picture`: `image_file` is a path (str) or
+    /// a binary file-like object. Omitted width/height derive from the image's
+    /// native size (dpi-aware), preserving aspect ratio when one is given.
+    #[pyo3(signature = (image_file, left, top, width=None, height=None))]
+    fn add_picture(
+        &self,
+        py: Python<'_>,
+        image_file: &Bound<'_, PyAny>,
+        left: i64,
+        top: i64,
+        width: Option<i64>,
+        height: Option<i64>,
+    ) -> PyResult<Py<PyAny>> {
+        let (blob, filename) = read_image_file(image_file)?;
+        let spec = pptx_core::imagespec::sniff(&blob).map_err(to_py)?;
+        let desc = filename.unwrap_or_else(|| format!("image.{}", spec.ext));
+
+        let mut prs = self.prs.borrow_mut(py);
+
+        // package-wide dedupe (python-pptx compares SHA1 of image blobs)
+        let image_part = match find_matching_image_part(&prs.pkg, &blob) {
+            Some(existing) => existing,
+            None => {
+                let name = next_image_part_name(prs.pkg.part_names(), spec.ext);
+                prs.pkg
+                    .add_default_content_type(spec.ext, spec.content_type)
+                    .map_err(to_py)?;
+                prs.pkg.add_binary_part(&name, blob).map_err(to_py)?;
+                name
+            }
+        };
+        let target = pptx_core::opc::relative_target(&self.part, &image_part);
+        let rid = prs
+            .pkg
+            .get_or_add_relationship(&self.part, IMAGE_RELTYPE, &target)
+            .map_err(to_py)?;
+
+        // python-pptx `ImagePart.scale` treats 0 the same as None
+        let (native_cx, native_cy) = spec.native_size_emu();
+        let (cx, cy) = match (width.filter(|v| *v != 0), height.filter(|v| *v != 0)) {
+            (Some(cx), Some(cy)) => (cx, cy),
+            (Some(cx), None) => (
+                cx,
+                (native_cy as f64 * cx as f64 / native_cx as f64).round() as i64,
+            ),
+            (None, Some(cy)) => (
+                (native_cx as f64 * cy as f64 / native_cy as f64).round() as i64,
+                cy,
+            ),
+            (None, None) => (native_cx, native_cy),
+        };
+
+        let shape_id = prs.take_next_shape_id(&self.part)?;
+        let name = format!("Picture {}", shape_id - 1);
+        let doc = prs.doc_mut(&self.part)?;
+        let tree = match self.container {
+            Some(n) => n,
+            None => sp_tree(doc)?,
+        };
+        let pic = new_pic(doc, shape_id, &name, &desc, &rid, left, top, cx, cy);
+        doc.append_child(tree, pic);
+        drop(prs);
+        self.shape(py, pic)
+    }
+
+    /// python-pptx `SlideShapes.add_shape`: `autoshape_type_id` is an
+    /// `MSO_SHAPE` member (any int-convertible works, including python-pptx's
+    /// own enum members).
+    fn add_shape(
+        &self,
+        py: Python<'_>,
+        autoshape_type_id: i64,
+        left: i64,
+        top: i64,
+        width: i64,
+        height: i64,
+    ) -> PyResult<Py<PyAny>> {
+        let (prst, basename) = autoshapes::autoshape_type(autoshape_type_id).ok_or_else(|| {
+            PyKeyError::new_err(format!("no autoshape type with id '{autoshape_type_id}'"))
+        })?;
+        let mut prs = self.prs.borrow_mut(py);
+        let shape_id = prs.take_next_shape_id(&self.part)?;
+        let name = format!("{basename} {}", shape_id - 1);
+        let doc = prs.doc_mut(&self.part)?;
+        let tree = match self.container {
+            Some(n) => n,
+            None => sp_tree(doc)?,
+        };
+        let sp = new_autoshape_sp(doc, shape_id, &name, prst, left, top, width, height);
+        doc.append_child(tree, sp);
+        drop(prs);
+        self.shape(py, sp)
+    }
+
+    /// python-pptx `SlideShapes.add_table`: width/height distribute evenly
+    /// over columns/rows (the last one absorbing rounding error).
+    #[allow(clippy::too_many_arguments)]
+    fn add_table(
+        &self,
+        py: Python<'_>,
+        rows: u32,
+        cols: u32,
+        left: i64,
+        top: i64,
+        width: i64,
+        height: i64,
+    ) -> PyResult<Py<PyAny>> {
+        if rows == 0 || cols == 0 {
+            return Err(PyValueError::new_err(
+                "table must have at least one row and column",
+            ));
+        }
+        let mut prs = self.prs.borrow_mut(py);
+        let shape_id = prs.take_next_shape_id(&self.part)?;
+        let name = format!("Table {}", shape_id - 1);
+        let doc = prs.doc_mut(&self.part)?;
+        let tree = match self.container {
+            Some(n) => n,
+            None => sp_tree(doc)?,
+        };
+        let frame =
+            new_table_graphic_frame(doc, shape_id, &name, rows, cols, left, top, width, height);
+        doc.append_child(tree, frame);
+        drop(prs);
+        self.shape(py, frame)
     }
 
     /// The title placeholder shape (`p:ph` idx 0), or None.
     #[getter]
-    fn title(&self, py: Python<'_>) -> PyResult<Option<Shape>> {
+    fn title(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let node = {
             let nodes = self.nodes(py)?;
             let mut prs = self.prs.borrow_mut(py);
@@ -874,7 +1019,7 @@ impl SlideShapes {
                 ph_elm(doc, n).is_some_and(|ph| doc.attr(ph, "idx").unwrap_or("0") == "0")
             })
         };
-        Ok(node.map(|n| self.shape(py, n)))
+        node.map(|n| self.shape(py, n)).transpose()
     }
 }
 
@@ -942,11 +1087,312 @@ fn new_textbox_sp(
     sp
 }
 
+/// python-pptx `Image.from_file`: a str is a filesystem path (its basename
+/// becomes the image description); anything else is a binary file-like object.
+fn read_image_file(image_file: &Bound<'_, PyAny>) -> PyResult<(Vec<u8>, Option<String>)> {
+    if let Ok(path) = image_file.extract::<String>() {
+        let blob = std::fs::read(&path)?;
+        let filename = std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        return Ok((blob, filename));
+    }
+    image_file.call_method1("seek", (0,))?;
+    let blob = image_file.call_method0("read")?.extract::<Vec<u8>>()?;
+    Ok((blob, None))
+}
+
+/// Existing `ppt/media/` part holding exactly `blob`, if any.
+fn find_matching_image_part(pkg: &pptx_core::opc::Package, blob: &[u8]) -> Option<String> {
+    pkg.part_names()
+        .iter()
+        .find(|n| n.starts_with("ppt/media/") && pkg.raw(n) == Some(blob))
+        .cloned()
+}
+
+/// First available `ppt/media/image{idx}.{ext}` (python-pptx reuses gaps in
+/// the sequence, not max+1).
+fn next_image_part_name(part_names: &[String], ext: &str) -> String {
+    let mut idxs: Vec<u32> = part_names
+        .iter()
+        .filter_map(|n| {
+            let rest = n.strip_prefix("ppt/media/image")?;
+            let (stem, _) = rest.rsplit_once('.')?;
+            stem.parse::<u32>().ok()
+        })
+        .collect();
+    idxs.sort_unstable();
+    let mut idx = idxs.len() as u32 + 1;
+    for (i, image_idx) in idxs.iter().enumerate() {
+        let candidate = i as u32 + 1;
+        if candidate < *image_idx {
+            idx = candidate;
+            break;
+        }
+    }
+    format!("ppt/media/image{idx}.{ext}")
+}
+
+/// Build a `p:pic` subtree matching python-pptx's `CT_Picture.new_pic`.
+#[allow(clippy::too_many_arguments)]
+fn new_pic(
+    doc: &mut Document,
+    shape_id: u32,
+    name: &str,
+    desc: &str,
+    rid: &str,
+    left: i64,
+    top: i64,
+    width: i64,
+    height: i64,
+) -> NodeId {
+    let id_s = shape_id.to_string();
+    let pic = doc.create_element(ns::P, "p", "pic", &[]);
+
+    let nv_pic_pr = doc.create_element(ns::P, "p", "nvPicPr", &[]);
+    let c_nv_pr = doc.create_element(
+        ns::P,
+        "p",
+        "cNvPr",
+        &[("id", id_s.as_str()), ("name", name), ("descr", desc)],
+    );
+    let c_nv_pic_pr = doc.create_element(ns::P, "p", "cNvPicPr", &[]);
+    let pic_locks = doc.create_element(ns::A, "a", "picLocks", &[("noChangeAspect", "1")]);
+    doc.append_child(c_nv_pic_pr, pic_locks);
+    let nv_pr = doc.create_element(ns::P, "p", "nvPr", &[]);
+    doc.append_child(nv_pic_pr, c_nv_pr);
+    doc.append_child(nv_pic_pr, c_nv_pic_pr);
+    doc.append_child(nv_pic_pr, nv_pr);
+    doc.append_child(pic, nv_pic_pr);
+
+    let blip_fill = doc.create_element(ns::P, "p", "blipFill", &[]);
+    let blip = doc.create_element(ns::A, "a", "blip", &[("r:embed", rid)]);
+    doc.append_child(blip_fill, blip);
+    let stretch = doc.create_element(ns::A, "a", "stretch", &[]);
+    let fill_rect = doc.create_element(ns::A, "a", "fillRect", &[]);
+    doc.append_child(stretch, fill_rect);
+    doc.append_child(blip_fill, stretch);
+    doc.append_child(pic, blip_fill);
+
+    let sp_pr = doc.create_element(ns::P, "p", "spPr", &[]);
+    append_xfrm(doc, sp_pr, left, top, width, height);
+    let prst_geom = doc.create_element(ns::A, "a", "prstGeom", &[("prst", "rect")]);
+    let av_lst = doc.create_element(ns::A, "a", "avLst", &[]);
+    doc.append_child(prst_geom, av_lst);
+    doc.append_child(sp_pr, prst_geom);
+    doc.append_child(pic, sp_pr);
+
+    pic
+}
+
+/// Build an autoshape `p:sp` subtree matching python-pptx's
+/// `CT_Shape.new_autoshape_sp` (theme-styled, centered empty text body).
+#[allow(clippy::too_many_arguments)]
+fn new_autoshape_sp(
+    doc: &mut Document,
+    shape_id: u32,
+    name: &str,
+    prst: &str,
+    left: i64,
+    top: i64,
+    width: i64,
+    height: i64,
+) -> NodeId {
+    let id_s = shape_id.to_string();
+    let sp = doc.create_element(ns::P, "p", "sp", &[]);
+
+    let nv_sp_pr = doc.create_element(ns::P, "p", "nvSpPr", &[]);
+    let c_nv_pr = doc.create_element(
+        ns::P,
+        "p",
+        "cNvPr",
+        &[("id", id_s.as_str()), ("name", name)],
+    );
+    let c_nv_sp_pr = doc.create_element(ns::P, "p", "cNvSpPr", &[]);
+    let nv_pr = doc.create_element(ns::P, "p", "nvPr", &[]);
+    doc.append_child(nv_sp_pr, c_nv_pr);
+    doc.append_child(nv_sp_pr, c_nv_sp_pr);
+    doc.append_child(nv_sp_pr, nv_pr);
+    doc.append_child(sp, nv_sp_pr);
+
+    let sp_pr = doc.create_element(ns::P, "p", "spPr", &[]);
+    append_xfrm(doc, sp_pr, left, top, width, height);
+    let prst_geom = doc.create_element(ns::A, "a", "prstGeom", &[("prst", prst)]);
+    let av_lst = doc.create_element(ns::A, "a", "avLst", &[]);
+    doc.append_child(prst_geom, av_lst);
+    doc.append_child(sp_pr, prst_geom);
+    doc.append_child(sp, sp_pr);
+
+    let style = doc.create_element(ns::P, "p", "style", &[]);
+    for (tag, idx, clr) in [
+        ("lnRef", "1", "accent1"),
+        ("fillRef", "3", "accent1"),
+        ("effectRef", "2", "accent1"),
+        ("fontRef", "minor", "lt1"),
+    ] {
+        let ref_el = doc.create_element(ns::A, "a", tag, &[("idx", idx)]);
+        let scheme_clr = doc.create_element(ns::A, "a", "schemeClr", &[("val", clr)]);
+        doc.append_child(ref_el, scheme_clr);
+        doc.append_child(style, ref_el);
+    }
+    doc.append_child(sp, style);
+
+    let tx_body = doc.create_element(ns::P, "p", "txBody", &[]);
+    let body_pr = doc.create_element(ns::A, "a", "bodyPr", &[("rtlCol", "0"), ("anchor", "ctr")]);
+    doc.append_child(tx_body, body_pr);
+    let lst_style = doc.create_element(ns::A, "a", "lstStyle", &[]);
+    doc.append_child(tx_body, lst_style);
+    let p = doc.create_element(ns::A, "a", "p", &[]);
+    let p_pr = doc.create_element(ns::A, "a", "pPr", &[("algn", "ctr")]);
+    doc.append_child(p, p_pr);
+    doc.append_child(tx_body, p);
+    doc.append_child(sp, tx_body);
+
+    sp
+}
+
+/// python-pptx's default table style GUID (`CT_Table.new_tbl`).
+const TABLE_STYLE_ID: &str = "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}";
+
+/// Build a `p:graphicFrame` containing an `a:tbl`, matching python-pptx's
+/// `CT_GraphicalObjectFrame.new_table_graphicFrame`.
+#[allow(clippy::too_many_arguments)]
+fn new_table_graphic_frame(
+    doc: &mut Document,
+    shape_id: u32,
+    name: &str,
+    rows: u32,
+    cols: u32,
+    left: i64,
+    top: i64,
+    width: i64,
+    height: i64,
+) -> NodeId {
+    let id_s = shape_id.to_string();
+    let frame = doc.create_element(ns::P, "p", "graphicFrame", &[]);
+
+    let nv_pr_grp = doc.create_element(ns::P, "p", "nvGraphicFramePr", &[]);
+    let c_nv_pr = doc.create_element(
+        ns::P,
+        "p",
+        "cNvPr",
+        &[("id", id_s.as_str()), ("name", name)],
+    );
+    let c_nv_frame_pr = doc.create_element(ns::P, "p", "cNvGraphicFramePr", &[]);
+    let locks = doc.create_element(ns::A, "a", "graphicFrameLocks", &[("noGrp", "1")]);
+    doc.append_child(c_nv_frame_pr, locks);
+    let nv_pr = doc.create_element(ns::P, "p", "nvPr", &[]);
+    doc.append_child(nv_pr_grp, c_nv_pr);
+    doc.append_child(nv_pr_grp, c_nv_frame_pr);
+    doc.append_child(nv_pr_grp, nv_pr);
+    doc.append_child(frame, nv_pr_grp);
+
+    // a graphicFrame's transform element is p:xfrm, not a:xfrm
+    let xfrm = doc.create_element(ns::P, "p", "xfrm", &[]);
+    let (x, y) = (left.to_string(), top.to_string());
+    let (cx, cy) = (width.to_string(), height.to_string());
+    let off = doc.create_element(ns::A, "a", "off", &[("x", x.as_str()), ("y", y.as_str())]);
+    let ext = doc.create_element(
+        ns::A,
+        "a",
+        "ext",
+        &[("cx", cx.as_str()), ("cy", cy.as_str())],
+    );
+    doc.append_child(xfrm, off);
+    doc.append_child(xfrm, ext);
+    doc.append_child(frame, xfrm);
+
+    let graphic = doc.create_element(ns::A, "a", "graphic", &[]);
+    let graphic_data = doc.create_element(
+        ns::A,
+        "a",
+        "graphicData",
+        &[("uri", GRAPHIC_DATA_URI_TABLE)],
+    );
+    let tbl = new_tbl(doc, rows, cols, width, height);
+    doc.append_child(graphic_data, tbl);
+    doc.append_child(graphic, graphic_data);
+    doc.append_child(frame, graphic);
+
+    frame
+}
+
+/// Build an `a:tbl` subtree matching python-pptx's `CT_Table.new_tbl`.
+fn new_tbl(doc: &mut Document, rows: u32, cols: u32, width: i64, height: i64) -> NodeId {
+    let tbl = doc.create_element(ns::A, "a", "tbl", &[]);
+    let tbl_pr = doc.create_element(ns::A, "a", "tblPr", &[("firstRow", "1"), ("bandRow", "1")]);
+    let style_id = doc.create_element(ns::A, "a", "tableStyleId", &[]);
+    doc.set_text(style_id, TABLE_STYLE_ID);
+    doc.append_child(tbl_pr, style_id);
+    doc.append_child(tbl, tbl_pr);
+
+    let tbl_grid = doc.create_element(ns::A, "a", "tblGrid", &[]);
+    let col_width = width / i64::from(cols);
+    for col in 0..cols {
+        // last column absorbs the integer-division remainder
+        let w = if col == cols - 1 {
+            width - i64::from(cols - 1) * col_width
+        } else {
+            col_width
+        };
+        let w_s = w.to_string();
+        let grid_col = doc.create_element(ns::A, "a", "gridCol", &[("w", w_s.as_str())]);
+        doc.append_child(tbl_grid, grid_col);
+    }
+    doc.append_child(tbl, tbl_grid);
+
+    let row_height = height / i64::from(rows);
+    for row in 0..rows {
+        let h = if row == rows - 1 {
+            height - i64::from(rows - 1) * row_height
+        } else {
+            row_height
+        };
+        let h_s = h.to_string();
+        let tr = doc.create_element(ns::A, "a", "tr", &[("h", h_s.as_str())]);
+        for _ in 0..cols {
+            let tc = doc.create_element(ns::A, "a", "tc", &[]);
+            let tx_body = doc.create_element(ns::A, "a", "txBody", &[]);
+            let body_pr = doc.create_element(ns::A, "a", "bodyPr", &[]);
+            let lst_style = doc.create_element(ns::A, "a", "lstStyle", &[]);
+            let p = doc.create_element(ns::A, "a", "p", &[]);
+            doc.append_child(tx_body, body_pr);
+            doc.append_child(tx_body, lst_style);
+            doc.append_child(tx_body, p);
+            doc.append_child(tc, tx_body);
+            let tc_pr = doc.create_element(ns::A, "a", "tcPr", &[]);
+            doc.append_child(tc, tc_pr);
+            doc.append_child(tr, tc);
+        }
+        doc.append_child(tbl, tr);
+    }
+
+    tbl
+}
+
+/// Append an `a:xfrm` (off/ext) child to `parent`.
+fn append_xfrm(doc: &mut Document, parent: NodeId, x: i64, y: i64, cx: i64, cy: i64) -> NodeId {
+    let xfrm = doc.create_element(ns::A, "a", "xfrm", &[]);
+    let (x, y) = (x.to_string(), y.to_string());
+    let (cx, cy) = (cx.to_string(), cy.to_string());
+    let off = doc.create_element(ns::A, "a", "off", &[("x", x.as_str()), ("y", y.as_str())]);
+    let ext = doc.create_element(
+        ns::A,
+        "a",
+        "ext",
+        &[("cx", cx.as_str()), ("cy", cy.as_str())],
+    );
+    doc.append_child(xfrm, off);
+    doc.append_child(xfrm, ext);
+    doc.append_child(parent, xfrm);
+    xfrm
+}
+
 // ---------------------------------------------------------------------------
 // Shape
 // ---------------------------------------------------------------------------
 
-#[pyclass(module = "pptx_rs._core")]
+#[pyclass(module = "pptx_rs._core", subclass)]
 pub struct Shape {
     prs: Py<Presentation>,
     part: String,
@@ -1430,6 +1876,26 @@ impl Shape {
     }
 }
 
+// python-pptx proxy-class names per shape element; all behavior lives on
+// `Shape`, the subclasses exist so `type(shape).__name__` and isinstance
+// checks match python-pptx's shape factory.
+
+/// `p:pic` (python-pptx `Picture`)
+#[pyclass(module = "pptx_rs._core", extends = Shape)]
+pub struct Picture;
+
+/// `p:graphicFrame` (python-pptx `GraphicFrame`)
+#[pyclass(module = "pptx_rs._core", extends = Shape)]
+pub struct GraphicFrame;
+
+/// `p:grpSp` (python-pptx `GroupShape`)
+#[pyclass(module = "pptx_rs._core", extends = Shape)]
+pub struct GroupShape;
+
+/// `p:cxnSp` (python-pptx `Connector`)
+#[pyclass(module = "pptx_rs._core", extends = Shape)]
+pub struct Connector;
+
 // ---------------------------------------------------------------------------
 // XmlElement (read-only oxml escape hatch)
 // ---------------------------------------------------------------------------
@@ -1591,28 +2057,34 @@ impl TextFrame {
     fn set_text(&self, py: Python<'_>, value: &str) -> PyResult<()> {
         let mut prs = self.prs.borrow_mut(py);
         let doc = prs.doc_mut(&self.part)?;
-        let paras = doc.children_named(self.node, ns::A, "p");
-        // one paragraph per line: reuse the first, drop the rest, append new
-        for &p in paras.iter().skip(1) {
-            doc.remove_child(self.node, p);
-        }
-        let mut lines = value.split('\n');
-        let first_line = lines.next().unwrap_or_default();
-        let first_p = match paras.first() {
-            Some(&p) => p,
-            None => {
-                let p = doc.create_element(ns::A, "a", "p", &[]);
-                doc.append_child(self.node, p);
-                p
-            }
-        };
-        set_paragraph_text(doc, first_p, first_line);
-        for line in lines {
-            let p = doc.create_element(ns::A, "a", "p", &[]);
-            set_paragraph_text(doc, p, line);
-            doc.append_child(self.node, p);
-        }
+        set_tx_body_text(doc, self.node, value);
         Ok(())
+    }
+}
+
+/// Replace all paragraphs of a text body with `value` (python-pptx text-setter
+/// semantics), shared by `TextFrame.text` and table `_Cell.text`.
+pub(crate) fn set_tx_body_text(doc: &mut Document, tx_body: NodeId, value: &str) {
+    let paras = doc.children_named(tx_body, ns::A, "p");
+    // one paragraph per line: reuse the first, drop the rest, append new
+    for &p in paras.iter().skip(1) {
+        doc.remove_child(tx_body, p);
+    }
+    let mut lines = value.split('\n');
+    let first_line = lines.next().unwrap_or_default();
+    let first_p = match paras.first() {
+        Some(&p) => p,
+        None => {
+            let p = doc.create_element(ns::A, "a", "p", &[]);
+            doc.append_child(tx_body, p);
+            p
+        }
+    };
+    set_paragraph_text(doc, first_p, first_line);
+    for line in lines {
+        let p = doc.create_element(ns::A, "a", "p", &[]);
+        set_paragraph_text(doc, p, line);
+        doc.append_child(tx_body, p);
     }
 }
 
@@ -1790,6 +2262,11 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<chart::Category>()?;
     m.add_class::<chart::Series>()?;
     m.add_class::<image::Image>()?;
+    m.add_class::<Picture>()?;
+    m.add_class::<GraphicFrame>()?;
+    m.add_class::<GroupShape>()?;
+    m.add_class::<Connector>()?;
     m.add_enum::<MSO_SHAPE_TYPE>()?;
+    m.add_enum::<autoshapes::MSO_AUTO_SHAPE_TYPE>()?;
     Ok(())
 }

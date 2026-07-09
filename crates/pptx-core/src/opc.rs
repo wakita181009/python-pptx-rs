@@ -175,6 +175,76 @@ impl Package {
         Ok(())
     }
 
+    /// Add a new binary (non-XML) part. The caller is responsible for making
+    /// sure its extension is covered by a `Default` content-type rule.
+    pub fn add_binary_part(&mut self, name: &str, blob: Vec<u8>) -> Result<()> {
+        if self.contains(name) {
+            return Err(Error::InvalidPackage(format!(
+                "part already exists: {name}"
+            )));
+        }
+        self.order.push(name.to_string());
+        self.parts.insert(
+            name.to_string(),
+            Part {
+                raw: Some(blob),
+                doc: None,
+                dirty: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Register a `Default` content-type rule for `ext` unless one exists
+    /// (extension comparison is case-insensitive per OPC).
+    pub fn add_default_content_type(&mut self, ext: &str, content_type: &str) -> Result<()> {
+        let ct = self.doc(CONTENT_TYPES_PART)?;
+        let exists = ct
+            .children_named(ct.root, ns::CT, "Default")
+            .into_iter()
+            .any(|d| {
+                ct.attr(d, "Extension")
+                    .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+            });
+        if exists {
+            return Ok(());
+        }
+        let ct = self.doc_mut(CONTENT_TYPES_PART)?;
+        let root = ct.root;
+        // schema requires Default elements before Override elements
+        let index = ct
+            .child_elements(root)
+            .into_iter()
+            .position(|c| ct.is(c, ns::CT, "Override"))
+            .unwrap_or_else(|| ct.child_elements(root).len());
+        let default_el = ct.create_element(
+            ns::CT,
+            "",
+            "Default",
+            &[("Extension", ext), ("ContentType", content_type)],
+        );
+        ct.insert_child(root, index, default_el);
+        Ok(())
+    }
+
+    /// Return the rId of an existing relationship of `source_part` matching
+    /// `reltype` and `target`, or add one (python-pptx `relate_to`).
+    pub fn get_or_add_relationship(
+        &mut self,
+        source_part: &str,
+        reltype: &str,
+        target: &str,
+    ) -> Result<String> {
+        let existing = self
+            .rels(source_part)?
+            .into_iter()
+            .find(|r| r.reltype == reltype && r.target == target && !r.is_external);
+        match existing {
+            Some(rel) => Ok(rel.id),
+            None => self.add_relationship(source_part, reltype, target),
+        }
+    }
+
     /// Add a relationship from `source_part`, creating its rels part when
     /// missing, and return the assigned rId.
     pub fn add_relationship(
@@ -283,6 +353,82 @@ pub fn resolve_target(source_part: &str, target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_package() -> Package {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        writer.start_file(CONTENT_TYPES_PART, options).unwrap();
+        writer
+            .write_all(
+                concat!(
+                    r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#,
+                    r#"<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>"#,
+                    r#"<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>"#,
+                    r#"</Types>"#,
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        Package::from_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn adds_binary_part_and_roundtrips() {
+        let mut pkg = minimal_package();
+        pkg.add_binary_part("ppt/media/image1.png", vec![1, 2, 3])
+            .unwrap();
+        assert!(
+            pkg.add_binary_part("ppt/media/image1.png", vec![9])
+                .is_err()
+        );
+        let saved = pkg.save_to_bytes().unwrap();
+        let pkg2 = Package::from_bytes(&saved).unwrap();
+        assert_eq!(pkg2.raw("ppt/media/image1.png"), Some(&[1u8, 2, 3][..]));
+    }
+
+    #[test]
+    fn default_content_type_added_once_before_overrides() {
+        let mut pkg = minimal_package();
+        pkg.add_default_content_type("png", "image/png").unwrap();
+        pkg.add_default_content_type("PNG", "image/png").unwrap();
+        pkg.add_default_content_type("rels", "ignored").unwrap();
+        let doc = pkg.doc(CONTENT_TYPES_PART).unwrap();
+        let defaults = doc.children_named(doc.root, ns::CT, "Default");
+        assert_eq!(defaults.len(), 2);
+        let children = doc.child_elements(doc.root);
+        // new Default sits before the Override element
+        assert!(doc.is(children[1], ns::CT, "Default"));
+        assert!(doc.is(children[2], ns::CT, "Override"));
+    }
+
+    #[test]
+    fn get_or_add_relationship_reuses_matching_rel() {
+        let mut pkg = minimal_package();
+        let r1 = pkg
+            .get_or_add_relationship(
+                "ppt/slides/slide1.xml",
+                "http://reltype/image",
+                "../media/image1.png",
+            )
+            .unwrap();
+        let r2 = pkg
+            .get_or_add_relationship(
+                "ppt/slides/slide1.xml",
+                "http://reltype/image",
+                "../media/image1.png",
+            )
+            .unwrap();
+        let r3 = pkg
+            .get_or_add_relationship(
+                "ppt/slides/slide1.xml",
+                "http://reltype/image",
+                "../media/image2.png",
+            )
+            .unwrap();
+        assert_eq!(r1, r2);
+        assert_ne!(r1, r3);
+    }
 
     #[test]
     fn resolves_relative_targets() {

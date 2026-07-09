@@ -13,7 +13,7 @@ the step definitions (python-pptx itself is a dev dependency from PyPI).
 uv run behave tests/compat/features -f plain
 ```
 
-## Status (2026-07-06, after MarkItDown read APIs)
+## Status (2026-07-09, after write-side add APIs)
 
 | feature | pass | fail/error | total | notes |
 |---|---|---|---|---|
@@ -26,13 +26,20 @@ uv run behave tests/compat/features -f plain
 | prs-presentation-props | 3 | 3 | 6 | slide_width/height/masters pass; notes_master, core_properties n/a |
 | txt-textframe | 4 | 15 | 19 | text/paragraphs pass; auto_size, word_wrap, margins, font not implemented |
 | txt-paragraph | 6 | 21 | 27 | text/runs/add_run pass; alignment, level, spacing, font not implemented |
-| shp-shapes | 3 | 88 | 91 | add_textbox, shapes.title pass; add_chart/picture/table/shape, freeform n/a |
-| **TOTAL** | **84** | **185** | **269** | |
+| shp-shapes | 23 | 68 | 91 | add_textbox/add_picture/add_shape/add_table + shape-class factory pass; add_chart/ole/movie, freeform, placeholder proxies n/a |
+| **TOTAL** | **104** | **165** | **269** | |
 
-Every remaining failure is an unimplemented API (shape/placeholder proxy
-class hierarchy, write-side chart/picture/table adds, masters/layouts,
-formatting properties), not a behavioral divergence in the implemented
-surface.
+Every remaining failure is an unimplemented API (placeholder proxy class
+hierarchy, `BaseShape` inheritance checks, write-side chart/ole/movie adds,
+masters/layouts, formatting properties), not a behavioral divergence in the
+implemented surface.
+
+Write-side add APIs (`add_picture`, `add_shape`, `add_table`, `add_textbox`)
+follow python-pptx semantics verified by parity tests in
+`tests/test_add_shapes.py`: image blobs are sniffed (PNG/JPEG/GIF/BMP/TIFF/
+WMF/EMF) for native dpi-aware sizing, identical images dedupe to one media
+part, and the shape factory returns `Picture`/`GraphicFrame`/`GroupShape`/
+`Connector`/`Shape` proxy classes like python-pptx's.
 
 ## MarkItDown integration
 
